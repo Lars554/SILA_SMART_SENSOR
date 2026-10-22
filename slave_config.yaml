@@ -1,0 +1,120 @@
+# Board: Generic ESP32-S3 Board (Generic)
+# Definition: definitions/boards/generic-esp32s3/manifest.yaml
+
+esphome:
+  name: slavex
+  friendly_name: slaveX
+
+esp32:
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+substitutions:
+  naam: slave-x
+  slave_id: x
+
+logger:
+  level: DEBUG
+  hardware_uart: UART0
+
+uart:
+  - id: rs485_uart
+    baud_rate: 9600
+    rx_pin:
+      number: GPIO17
+      mode:
+        input: true
+        pullup: true
+    tx_pin: GPIO18
+    flow_control_pin: GPIO16
+
+i2c:
+  - id: i2c_1
+    scl: GPIO8
+    sda: GPIO9
+
+sensor:
+  - platform: scd30
+    id: sensor_scd30_1
+    i2c_id: i2c_1
+    update_interval: 5s
+    co2:
+      name: CO2
+      id: sensor_scd30_1_co2
+    humidity:
+      name: Humidity
+      id: sensor_scd30_1_humidity
+    temperature:
+      name: Temperature
+      id: sensor_scd30_1_temperature
+
+interval:
+  # Testmelding om de 5 seconden
+  - interval: 5s
+    then:
+      - logger.log:
+          level: INFO
+          tag: "rs485"
+          format: "TEST: slave ${slave_id} draait en wacht op PULL"
+
+  # Bus uitlezen en antwoorden op PULL
+  - interval: 10ms
+    then:
+      - lambda: |-
+          static std::string buffer;
+          const std::string command = "PULL ${slave_id}";
+
+          while (id(rs485_uart).available()) {
+            uint8_t c;
+            if (!id(rs485_uart).read_byte(&c)) break;
+
+            if (c == '\n' || c == '\r') {
+              // Eindigt de buffer op ons commando? (rommel ervoor wordt genegeerd)
+              bool match = buffer.size() >= command.size() &&
+                           buffer.compare(buffer.size() - command.size(),
+                                          command.size(), command) == 0;
+
+              if (match) {
+                ESP_LOGI("rs485", "PULL ontvangen van master");
+
+                // Sensorwaarden ophalen (null als er nog geen meting is)
+                auto fmt = [](float v, int dec, char *out, size_t n) {
+                  if (std::isnan(v)) snprintf(out, n, "null");
+                  else snprintf(out, n, "%.*f", dec, v);
+                };
+                char co2[16], temp[16], hum[16];
+                fmt(id(sensor_scd30_1_co2).state, 0, co2, sizeof(co2));
+                fmt(id(sensor_scd30_1_temperature).state, 1, temp, sizeof(temp));
+                fmt(id(sensor_scd30_1_humidity).state, 1, hum, sizeof(hum));
+
+                char payload[128];
+                snprintf(payload, sizeof(payload),
+                         "{\"co2\":%s,\"temp\":%s,\"hum\":%s}", co2, temp, hum);
+
+                delay(5);
+
+                // Preambule zodat de master in sync komt
+                uint8_t preamble[16];
+                memset(preamble, 0xFF, sizeof(preamble));
+                id(rs485_uart).write_array(preamble, sizeof(preamble));
+
+                // Bericht: $ID:payload   ($$ wordt in ESPHome een gewone $)
+                std::string msg = std::string("$$") + "${slave_id}:" + payload + "\n";
+                id(rs485_uart).write_array(
+                    reinterpret_cast<const uint8_t *>(msg.c_str()), msg.size());
+                id(rs485_uart).flush();
+
+                ESP_LOGI("rs485", "Verstuurd: ${slave_id}:%s", payload);
+
+                // Rommel van eigen zendmoment weggooien
+                while (id(rs485_uart).available()) {
+                  uint8_t d;
+                  id(rs485_uart).read_byte(&d);
+                }
+              }
+              buffer.clear();
+            } else if (c >= 0x20 && c <= 0x7E && buffer.size() < 64) {
+              buffer.push_back((char) c);
+            }
+          }

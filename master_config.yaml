@@ -1,0 +1,192 @@
+# Board: Generic ESP32-S3 Board (Generic)
+# Definition: definitions/boards/generic-esp32s3/manifest.yaml
+
+substitutions:
+  name: MasterX
+  slaves: "P320,P321"   # Slave toevoegen: ID hier bijzetten, bv. "P320,P321,P322"
+  poll_timeout: "150"   # ms wachten op antwoord
+  poll_gap: "500"       # ms pauze tussen twee polls
+
+esphome:
+  name: masterx
+  friendly_name: MasterX
+  on_boot:
+    priority: 600
+    then:
+      - lambda: |-
+          // Slavelijst uit de tekst halen
+          std::string list = "${slaves}";
+          size_t start = 0;
+          while (start <= list.size()) {
+            size_t end = list.find(',', start);
+            if (end == std::string::npos) end = list.size();
+            std::string sid = list.substr(start, end - start);
+            sid.erase(0, sid.find_first_not_of(' '));
+            sid.erase(sid.find_last_not_of(' ') + 1);
+            if (!sid.empty()) id(slave_ids).push_back(sid);
+            start = end + 1;
+          }
+          ESP_LOGI("rs485", "%d slave(s) geconfigureerd", (int) id(slave_ids).size());
+
+
+esp32:
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: "MO73QzmzeAeVY/v5kj/afOovcx+qf5nl4c9/6oSITyk="
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: MasterFull Fallback Hotspot
+    password: "p9PGi9fbn8Q2"
+
+captive_portal:
+mqtt:
+  id: mqtt_client
+  broker: 10.127.246.213
+  username: mqtt_user
+  password: mqtt_user
+
+uart:
+  - id: rs485_uart
+    baud_rate: 9600
+    rx_pin:
+      number: GPIO17
+      mode:
+        input: true
+        pullup: true
+    tx_pin: GPIO18
+    flow_control_pin: GPIO16
+
+globals:
+  - id: slave_ids
+    type: std::vector<std::string>
+  - id: discovered
+    type: std::vector<std::string>
+  - id: poll_index
+    type: int
+    initial_value: '0'
+  - id: current_slave
+    type: std::string
+    initial_value: '""'
+  - id: waiting
+    type: bool
+    initial_value: 'false'
+  - id: poll_time
+    type: uint32_t
+    initial_value: '0'
+  - id: rx_buffer
+    type: std::string
+    initial_value: '""'
+  - id: in_message
+    type: bool
+    initial_value: 'false'
+
+interval:
+  - interval: 10ms
+    then:
+      - lambda: |-
+          auto &slaves = id(slave_ids);
+          uint32_t now = millis();
+
+          // Lokaal één keer aankondigen bij Home Assistant (MQTT discovery)
+          auto announce = [&](const std::string &sid) {
+            struct Field { const char *key; const char *name; const char *unit; const char *cls; };
+            const Field fields[] = {
+              {"co2",  "CO2",              "ppm", "carbon_dioxide"},
+              {"temp", "Temperatuur",      "°C",  "temperature"},
+              {"hum",  "Luchtvochtigheid", "%",   "humidity"},
+            };
+            // Template opgesplitst zodat ESPHome er niet aan komt
+            const std::string open = "{" "{";
+            const std::string close = "}" "}";
+            for (auto &f : fields) {
+              std::string topic = "homeassistant/sensor/bus_" + sid + "_" + f.key + "/config";
+              std::string cfg = std::string("{") +
+                "\"name\":\"" + f.name + "\"," +
+                "\"uniq_id\":\"bus_" + sid + "_" + f.key + "\"," +
+                "\"stat_t\":\"gebouw/" + sid + "/state\"," +
+                "\"val_tpl\":\"" + open + " value_json." + f.key + " " + close + "\"," +
+                "\"unit_of_meas\":\"" + f.unit + "\"," +
+                "\"dev_cla\":\"" + f.cls + "\"," +
+                "\"stat_cla\":\"measurement\"," +
+                "\"dev\":{\"ids\":[\"bus_" + sid + "\"],\"name\":\"Lokaal " + sid + "\"}" +
+                "}";
+              id(mqtt_client).publish(topic, cfg, 0, true);
+            }
+            ESP_LOGI("mqtt", "Lokaal %s aangekondigd bij Home Assistant", sid.c_str());
+          };
+
+          // 1. Binnenkomende bytes lezen
+          while (id(rs485_uart).available()) {
+            uint8_t c;
+            if (!id(rs485_uart).read_byte(&c)) break;
+
+            if (c == '$') {
+              id(rx_buffer).clear();
+              id(in_message) = true;
+            } else if (c == '\n' || c == '\r') {
+              if (id(in_message) && !id(rx_buffer).empty()) {
+                std::string msg = id(rx_buffer);
+                size_t sep = msg.find(':');
+                std::string from = msg.substr(0, sep);
+                std::string payload = (sep == std::string::npos) ? "" : msg.substr(sep + 1);
+
+                if (id(waiting) && from == id(current_slave)) {
+                  ESP_LOGI("rs485", "[%s] %s (%u ms)",
+                           from.c_str(), payload.c_str(), (unsigned) (now - id(poll_time)));
+                  id(waiting) = false;
+                  id(poll_time) = now;
+
+                  // Doorsturen naar Home Assistant
+                  if (id(mqtt_client).is_connected() && !payload.empty() && payload[0] == '{') {
+                    auto &d = id(discovered);
+                    bool known = false;
+                    for (auto &s : d) if (s == from) known = true;
+                    if (!known) {
+                      announce(from);
+                      d.push_back(from);
+                    }
+                    id(mqtt_client).publish("gebouw/" + from + "/state", payload, 0, true);
+                  }
+                } else {
+                  ESP_LOGW("rs485", "Onverwacht bericht: %s", msg.c_str());
+                }
+              }
+              id(rx_buffer).clear();
+              id(in_message) = false;
+            } else if (id(in_message) && c >= 0x20 && c <= 0x7E && id(rx_buffer).size() < 256) {
+              id(rx_buffer).push_back((char) c);
+            }
+          }
+
+          // 2. Timeout: slave antwoordt niet
+          if (id(waiting) && now - id(poll_time) > ${poll_timeout}) {
+            ESP_LOGW("rs485", "[%s] geen antwoord", id(current_slave).c_str());
+            id(waiting) = false;
+            id(poll_time) = now;
+          }
+
+          // 3. Volgende slave aanspreken
+          if (!id(waiting) && !slaves.empty() && now - id(poll_time) >= ${poll_gap}) {
+            id(current_slave) = slaves[id(poll_index)];
+            id(poll_index) = (id(poll_index) + 1) % slaves.size();
+
+            std::string out = "PULL " + id(current_slave) + "\n";
+            id(rs485_uart).write_array(
+                reinterpret_cast<const uint8_t *>(out.c_str()), out.size());
+            id(rs485_uart).flush();
+
+            id(waiting) = true;
+            id(poll_time) = millis();
+          }

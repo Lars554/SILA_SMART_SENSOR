@@ -1,21 +1,52 @@
 # Board: Generic ESP32-S3 Board (Generic)
 # Definition: definitions/boards/generic-esp32s3/manifest.yaml
 
+# ============================================================
+# MASTER-NODE (RS-485-bus → MQTT → Home Assistant)
+#
+# Pollt om beurt elk lokaal (slave) via de RS-485-bus en stuurt
+# de ontvangen sensordata via MQTT door naar Home Assistant.
+# Elk lokaal verschijnt automatisch als apparaat "Lokaal Pxxx".
+#
+# AAN TE PASSEN BIJ EEN NIEUWE MASTER:
+#   name / friendly_name : nummer van de master, bv. master1 / Master1
+#                          (name enkel kleine letters)
+#   lokalen              : lijst met lokalen op deze bus, gescheiden
+#                          door komma's. Elk nummer moet exact gelijk
+#                          zijn aan slave_id in de slave van dat lokaal.
+#   mqtt → broker        : IP-adres van de MQTT-broker (Home Assistant).
+#                          Verandert als je van netwerk wisselt!
+#
+# INSTELLINGEN:
+#   poll_timeout : hoe lang (ms) de master op een antwoord wacht.
+#                  Verhogen als je vaak "geen antwoord" ziet bij
+#                  lange berichten.
+#   poll_gap     : pauze (ms) tussen twee polls.
+#
+# BEDRADING RS-485-module (MAX3485):
+#   GPIO42 = RO (RX) | GPIO41 = DI (TX) | GPIO16 = DE/RE
+#
+# DATA:
+#   Topic in MQTT : gebouw/<lokaal>/state
+#   Inhoud        : {"co2":616,"temp":22.1,"hum":45.3}
+# ============================================================
+
 substitutions:
-  name: MasterX
-  slaves: "P320,P321"   # Slave toevoegen: ID hier bijzetten, bv. "P320,P321,P322"
-  poll_timeout: "150"   # ms wachten op antwoord
-  poll_gap: "500"       # ms pauze tussen twee polls
+  name: master1
+  friendly_name: Master1
+  lokalen: "P320,P321"
+  poll_timeout: "150"
+  poll_gap: "500"
 
 esphome:
-  name: masterx
-  friendly_name: MasterX
+  name: ${name}
+  friendly_name: ${friendly_name}
   on_boot:
     priority: 600
     then:
       - lambda: |-
           // Slavelijst uit de tekst halen
-          std::string list = "${slaves}";
+          std::string list = "${lokalen}";
           size_t start = 0;
           while (start <= list.size()) {
             size_t end = list.find(',', start);
@@ -23,10 +54,10 @@ esphome:
             std::string sid = list.substr(start, end - start);
             sid.erase(0, sid.find_first_not_of(' '));
             sid.erase(sid.find_last_not_of(' ') + 1);
-            if (!sid.empty()) id(slave_ids).push_back(sid);
+            if (!sid.empty()) id(lokalens).push_back(sid);
             start = end + 1;
           }
-          ESP_LOGI("rs485", "%d slave(s) geconfigureerd", (int) id(slave_ids).size());
+          ESP_LOGI("rs485", "%d slave(s) geconfigureerd", (int) id(lokalens).size());
 
 
 esp32:
@@ -38,7 +69,7 @@ logger:
 
 api:
   encryption:
-    key: "MO73QzmzeAeVY/v5kj/afOovcx+qf5nl4c9/6oSITyk="
+    key: ""
 
 ota:
   - platform: esphome
@@ -46,9 +77,7 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-  ap:
-    ssid: MasterFull Fallback Hotspot
-    password: "p9PGi9fbn8Q2"
+
 
 captive_portal:
 mqtt:
@@ -61,15 +90,15 @@ uart:
   - id: rs485_uart
     baud_rate: 9600
     rx_pin:
-      number: GPIO17
+      number: GPIO42
       mode:
         input: true
         pullup: true
-    tx_pin: GPIO18
+    tx_pin: GPIO41
     flow_control_pin: GPIO16
 
 globals:
-  - id: slave_ids
+  - id: lokalens
     type: std::vector<std::string>
   - id: discovered
     type: std::vector<std::string>
@@ -96,7 +125,7 @@ interval:
   - interval: 10ms
     then:
       - lambda: |-
-          auto &slaves = id(slave_ids);
+          auto &lokalen = id(lokalens);
           uint32_t now = millis();
 
           // Lokaal één keer aankondigen bij Home Assistant (MQTT discovery)
@@ -178,9 +207,9 @@ interval:
           }
 
           // 3. Volgende slave aanspreken
-          if (!id(waiting) && !slaves.empty() && now - id(poll_time) >= ${poll_gap}) {
-            id(current_slave) = slaves[id(poll_index)];
-            id(poll_index) = (id(poll_index) + 1) % slaves.size();
+          if (!id(waiting) && !lokalen.empty() && now - id(poll_time) >= ${poll_gap}) {
+            id(current_slave) = lokalen[id(poll_index)];
+            id(poll_index) = (id(poll_index) + 1) % lokalen.size();
 
             std::string out = "PULL " + id(current_slave) + "\n";
             id(rs485_uart).write_array(

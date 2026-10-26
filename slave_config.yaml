@@ -1,33 +1,72 @@
 # Board: Generic ESP32-S3 Board (Generic)
 # Definition: definitions/boards/generic-esp32s3/manifest.yaml
 
+# ============================================================
+# SLAVE-NODE (sensoren → RS-485-bus → master)
+#
+# Meet CO2, temperatuur en luchtvochtigheid met een SCD30 en
+# antwoordt op de bus als de master "PULL <lokaal>" stuurt.
+#
+# AAN TE PASSEN BIJ EEN NIEUWE SLAVE:
+#   name          : naam in ESPHome, enkel kleine letters,
+#                   bv. lokaalp105
+#   friendly_name : leesbare naam, bv. Lokaal P105
+#   lokaal        : nummer van het lokaal, bv. P105.
+#                   Moet EXACT (ook hoofdletters) gelijk zijn aan
+#                   een nummer in "lokalen" van de master.
+#
+# BEDRADING:
+#   RS-485-module (MAX3485):
+#     GPIO42 = RO (RX) | GPIO12 = DI (TX) | GPIO41 = DE/RE
+#   SCD30 (I2C, adres 0x61):
+#     GPIO9 = SDA | GPIO8 = SCL
+#
+# PROTOCOL:
+#   Ontvangt : PULL <lokaal>
+#   Antwoord : 16 opvulbytes (0xFF) + $<lokaal>:{"co2":616,"temp":22.1,"hum":45.3}
+#   Zolang de SCD30 nog geen meting heeft, staat er null.
+# ============================================================
+
+substitutions:
+  name: lokaalp105
+  friendly_name: Lokaal P105
+  lokaal: P105
+
 esphome:
-  name: slavex
-  friendly_name: slaveX
+  name: ${name}
+  friendly_name: ${friendly_name}
 
 esp32:
   variant: esp32s3
   framework:
     type: esp-idf
 
-substitutions:
-  naam: slave-x
-  slave_id: x
-
 logger:
   level: DEBUG
   hardware_uart: UART0
+
+# Laat hier de api-, ota- en wifi-regels staan die ESPHome voor deze slave aanmaakte
+api:
+  encryption:
+    key: "EIGEN_SLEUTEL_VAN_DEZE_SLAVE"
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
 
 uart:
   - id: rs485_uart
     baud_rate: 9600
     rx_pin:
-      number: GPIO17
+      number: GPIO42
       mode:
         input: true
         pullup: true
-    tx_pin: GPIO18
-    flow_control_pin: GPIO16
+    tx_pin: GPIO12
+    flow_control_pin: GPIO41
 
 i2c:
   - id: i2c_1
@@ -56,14 +95,14 @@ interval:
       - logger.log:
           level: INFO
           tag: "rs485"
-          format: "TEST: slave ${slave_id} draait en wacht op PULL"
+          format: "TEST: slave ${lokaal} draait en wacht op PULL"
 
   # Bus uitlezen en antwoorden op PULL
   - interval: 10ms
     then:
       - lambda: |-
           static std::string buffer;
-          const std::string command = "PULL ${slave_id}";
+          const std::string command = "PULL ${lokaal}";
 
           while (id(rs485_uart).available()) {
             uint8_t c;
@@ -100,12 +139,12 @@ interval:
                 id(rs485_uart).write_array(preamble, sizeof(preamble));
 
                 // Bericht: $ID:payload   ($$ wordt in ESPHome een gewone $)
-                std::string msg = std::string("$$") + "${slave_id}:" + payload + "\n";
+                std::string msg = std::string("$$") + "${lokaal}:" + payload + "\n";
                 id(rs485_uart).write_array(
                     reinterpret_cast<const uint8_t *>(msg.c_str()), msg.size());
                 id(rs485_uart).flush();
 
-                ESP_LOGI("rs485", "Verstuurd: ${slave_id}:%s", payload);
+                ESP_LOGI("rs485", "Verstuurd: ${lokaal}:%s", payload);
 
                 // Rommel van eigen zendmoment weggooien
                 while (id(rs485_uart).available()) {

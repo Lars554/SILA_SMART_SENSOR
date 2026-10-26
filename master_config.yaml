@@ -13,7 +13,7 @@
 #                          (name enkel kleine letters)
 #   lokalen              : lijst met lokalen op deze bus, gescheiden
 #                          door komma's. Elk nummer moet exact gelijk
-#                          zijn aan slave_id in de slave van dat lokaal.
+#                          zijn aan lokaal in de slave van dat lokaal.
 #   mqtt → broker        : IP-adres van de MQTT-broker (Home Assistant).
 #                          Verandert als je van netwerk wisselt!
 #
@@ -24,7 +24,17 @@
 #   poll_gap     : pauze (ms) tussen twee polls.
 #
 # BEDRADING RS-485-module (MAX3485):
-#   GPIO42 = RO (RX) | GPIO41 = DI (TX) | GPIO16 = DE/RE
+#   GPIO17 = RO (RX) | GPIO18 = DI (TX) | GPIO16 = DE/RE
+#
+# BEDRADING STATUS-LED:
+#   GPIO48 = ingebouwde NeoPixel (WS2812)
+#
+# STATUS-LED (ingebouwde NeoPixel op GPIO48):
+#   Groen  = alles werkt
+#   Oranje = flits bij versturen van een PULL
+#   Paars  = flits bij ontvangen van een geldig antwoord
+#   Rood   = systeemfout: geen MQTT-verbinding of 10 s lang
+#            geen enkel lokaal dat antwoordt
 #
 # DATA:
 #   Topic in MQTT : gebouw/<lokaal>/state
@@ -42,23 +52,26 @@ esphome:
   name: ${name}
   friendly_name: ${friendly_name}
   on_boot:
-    priority: 600
-    then:
-      - lambda: |-
-          // Slavelijst uit de tekst halen
-          std::string list = "${lokalen}";
-          size_t start = 0;
-          while (start <= list.size()) {
-            size_t end = list.find(',', start);
-            if (end == std::string::npos) end = list.size();
-            std::string sid = list.substr(start, end - start);
-            sid.erase(0, sid.find_first_not_of(' '));
-            sid.erase(sid.find_last_not_of(' ') + 1);
-            if (!sid.empty()) id(lokalens).push_back(sid);
-            start = end + 1;
-          }
-          ESP_LOGI("rs485", "%d slave(s) geconfigureerd", (int) id(lokalens).size());
-
+    - priority: 600
+      then:
+        - lambda: |-
+            // Slavelijst uit de tekst halen
+            std::string list = "${lokalen}";
+            size_t start = 0;
+            while (start <= list.size()) {
+              size_t end = list.find(',', start);
+              if (end == std::string::npos) end = list.size();
+              std::string sid = list.substr(start, end - start);
+              sid.erase(0, sid.find_first_not_of(' '));
+              sid.erase(sid.find_last_not_of(' ') + 1);
+              if (!sid.empty()) id(lokalens).push_back(sid);
+              start = end + 1;
+            }
+            ESP_LOGI("rs485", "%d slave(s) geconfigureerd", (int) id(lokalens).size());
+    # STATUS-LED: groen bij opstarten
+    - priority: -100
+      then:
+        - script.execute: led_base
 
 esp32:
   variant: esp32s3
@@ -69,7 +82,7 @@ logger:
 
 api:
   encryption:
-    key: ""
+    key: "EIGEN_SLEUTEL_VAN_DEZE_SLAVE"
 
 ota:
   - platform: esphome
@@ -97,6 +110,58 @@ uart:
     tx_pin: GPIO18
     flow_control_pin: GPIO16
 
+# STATUS-LED
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_led
+    pin: GPIO48
+    num_leds: 1
+    chipset: WS2812
+    rgb_order: GRB
+    default_transition_length: 0s
+    restore_mode: ALWAYS_OFF
+
+# STATUS-LED
+script:
+  # Basiskleur: groen als alles goed is, rood bij een fout
+  - id: led_base
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(sys_error);'
+          then:
+            - light.turn_on:
+                id: status_led
+                red: 100%
+                green: 0%
+                blue: 0%
+                brightness: 30%
+          else:
+            - light.turn_on:
+                id: status_led
+                red: 0%
+                green: 100%
+                blue: 0%
+                brightness: 30%
+
+  # Korte flits in een kleur, daarna terug naar de basiskleur
+  - id: led_flash
+    mode: restart
+    parameters:
+      r: float
+      g: float
+      b: float
+    then:
+      - light.turn_on:
+          id: status_led
+          red: !lambda 'return r;'
+          green: !lambda 'return g;'
+          blue: !lambda 'return b;'
+          brightness: 30%
+      - delay: 100ms
+      - script.execute: led_base
+
 globals:
   - id: lokalens
     type: std::vector<std::string>
@@ -120,6 +185,13 @@ globals:
   - id: in_message
     type: bool
     initial_value: 'false'
+  # STATUS-LED
+  - id: sys_error
+    type: bool
+    initial_value: 'false'
+  - id: last_ok
+    type: uint32_t
+    initial_value: '0'
 
 interval:
   - interval: 10ms
@@ -177,6 +249,10 @@ interval:
                   id(waiting) = false;
                   id(poll_time) = now;
 
+                  // STATUS-LED: paars bij geldig antwoord
+                  id(last_ok) = now;
+                  id(led_flash).execute(0.6, 0.0, 1.0);
+
                   // Doorsturen naar Home Assistant
                   if (id(mqtt_client).is_connected() && !payload.empty() && payload[0] == '{') {
                     auto &d = id(discovered);
@@ -216,6 +292,23 @@ interval:
                 reinterpret_cast<const uint8_t *>(out.c_str()), out.size());
             id(rs485_uart).flush();
 
+            // STATUS-LED: oranje bij versturen
+            id(led_flash).execute(1.0, 0.35, 0.0);
+
             id(waiting) = true;
             id(poll_time) = millis();
+          }
+
+  # STATUS-LED: om de seconde controleren op een systeemfout
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (millis() < 30000) return;   // opstarttijd
+          bool err = !id(mqtt_client).is_connected() ||
+                     (millis() - id(last_ok) > 10000);
+          if (err != id(sys_error)) {
+            id(sys_error) = err;
+            if (err) ESP_LOGE("status", "Systeemfout: geen MQTT of geen enkel lokaal antwoordt");
+            else ESP_LOGI("status", "Systeem terug OK");
+            id(led_base).execute();
           }

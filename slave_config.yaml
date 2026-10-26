@@ -17,9 +17,17 @@
 #
 # BEDRADING:
 #   RS-485-module (MAX3485):
-#     GPIO42 = RO (RX) | GPIO12 = DI (TX) | GPIO41 = DE/RE
+#     GPIO17 = RO (RX) | GPIO18 = DI (TX) | GPIO16 = DE/RE
 #   SCD30 (I2C, adres 0x61):
 #     GPIO9 = SDA | GPIO8 = SCL
+#   Status-LED:
+#     GPIO48 = ingebouwde NeoPixel (WS2812)
+#
+# STATUS-LED:
+#   Groen          = alles werkt
+#   Paars → oranje = PULL ontvangen en antwoord verstuurd
+#   Rood           = systeemfout: 10 s lang geen PULL van de
+#                    master, of de SCD30 geeft geen meting
 #
 # PROTOCOL:
 #   Ontvangt : PULL <lokaal>
@@ -35,6 +43,11 @@ substitutions:
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
+  # STATUS-LED: groen bij opstarten
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: led_base
 
 esp32:
   variant: esp32s3
@@ -45,7 +58,6 @@ logger:
   level: DEBUG
   hardware_uart: UART0
 
-# Laat hier de api-, ota- en wifi-regels staan die ESPHome voor deze slave aanmaakte
 api:
   encryption:
     key: "EIGEN_SLEUTEL_VAN_DEZE_SLAVE"
@@ -88,6 +100,70 @@ sensor:
       name: Temperature
       id: sensor_scd30_1_temperature
 
+# STATUS-LED
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_led
+    pin: GPIO48
+    num_leds: 1
+    chipset: WS2812
+    rgb_order: GRB
+    default_transition_length: 0s
+    restore_mode: ALWAYS_OFF
+
+# STATUS-LED
+script:
+  # Basiskleur: groen als alles goed is, rood bij een fout
+  - id: led_base
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(sys_error);'
+          then:
+            - light.turn_on:
+                id: status_led
+                red: 100%
+                green: 0%
+                blue: 0%
+                brightness: 30%
+          else:
+            - light.turn_on:
+                id: status_led
+                red: 0%
+                green: 100%
+                blue: 0%
+                brightness: 30%
+
+  # Paars (ontvangen) en daarna oranje (verstuurd)
+  - id: led_rx_tx
+    mode: restart
+    then:
+      - light.turn_on:
+          id: status_led
+          red: 60%
+          green: 0%
+          blue: 100%
+          brightness: 30%
+      - delay: 80ms
+      - light.turn_on:
+          id: status_led
+          red: 100%
+          green: 35%
+          blue: 0%
+          brightness: 30%
+      - delay: 80ms
+      - script.execute: led_base
+
+# STATUS-LED
+globals:
+  - id: sys_error
+    type: bool
+    initial_value: 'false'
+  - id: last_ok
+    type: uint32_t
+    initial_value: '0'
+
 interval:
   # Testmelding om de 5 seconden
   - interval: 5s
@@ -116,6 +192,10 @@ interval:
 
               if (match) {
                 ESP_LOGI("rs485", "PULL ontvangen van master");
+
+                // STATUS-LED: paars → oranje
+                id(last_ok) = millis();
+                id(led_rx_tx).execute();
 
                 // Sensorwaarden ophalen (null als er nog geen meting is)
                 auto fmt = [](float v, int dec, char *out, size_t n) {
@@ -156,4 +236,18 @@ interval:
             } else if (c >= 0x20 && c <= 0x7E && buffer.size() < 64) {
               buffer.push_back((char) c);
             }
+          }
+
+  # STATUS-LED: om de seconde controleren op een systeemfout
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (millis() < 30000) return;   // opstarttijd
+          bool err = (millis() - id(last_ok) > 10000) ||
+                     std::isnan(id(sensor_scd30_1_co2).state);
+          if (err != id(sys_error)) {
+            id(sys_error) = err;
+            if (err) ESP_LOGE("status", "Systeemfout: geen PULL van master of SCD30 meet niet");
+            else ESP_LOGI("status", "Systeem terug OK");
+            id(led_base).execute();
           }
